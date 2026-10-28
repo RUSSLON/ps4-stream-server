@@ -7,6 +7,7 @@ returned explicitly as empty values rather than fabricated data.
 from __future__ import annotations
 
 import re
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -19,9 +20,29 @@ _CACHE: dict[str, tuple[float, Any]] = {}
 _LOCK = threading.Lock()
 
 
+# Only administrator-configured, explicitly supported public mirrors.
+# Not a CAPTCHA bypass; mirror access is still subject to the site's rules.
+_ALLOWED_SOURCE_HOSTS = frozenset({
+    'rezka.ag', 'hdrezka.ag', 'rezka.fi', 'rezka-tv.org', 'hdrezka-fly.net'
+})
+
+
+def source_origin() -> str:
+    mirror = os.environ.get('CATALOG_MIRROR', '').strip()
+    if not mirror:
+        return 'https://rezka.ag'
+    parsed = urlparse(mirror)
+    if (parsed.scheme != 'https' or parsed.hostname not in _ALLOWED_SOURCE_HOSTS
+            or parsed.port not in (None, 443) or parsed.username or parsed.password
+            or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+        raise ValueError('CATALOG_MIRROR должен быть HTTPS-доменом из разрешённого списка')
+    return 'https://' + parsed.hostname
+
+
 def _client():
     from HDrezka import HDrezka
-    return HDrezka()
+    mirror = os.environ.get('CATALOG_MIRROR', '').strip()
+    return HDrezka(mirror=source_origin()) if mirror else HDrezka()
 
 
 def _text(obj: Any, *names: str) -> str:

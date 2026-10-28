@@ -4,6 +4,11 @@ The app never proxies media. POST /api/launch stays on the existing PS4 server.
 """
 import json
 import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,6 +18,82 @@ except ImportError:
     import catalog
 
 MAX_QUERY = 1024
+PROBE_INTERVAL = 90
+_probe_lock = threading.Lock()
+_last_probe = 0.0
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+def probe_source(section: str) -> dict:
+    """Read-only, bounded inspection of the configured public catalog page.
+
+    This is an independent probe, not the exact request sent by HDrezka.
+    It never prints HTML, cookies, query strings, tokens, or response bodies.
+    """
+    section = section if section in ('films', 'series', 'cartoons', 'anime') else 'films'
+    origin = catalog.source_origin()
+    url = origin + '/' + ('series' if section == 'series' else section) + '/'
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/119.0',
+        'Accept': 'text/html,application/xhtml+xml',
+    })
+    status = None
+    content_type = ''
+    body = b''
+    try:
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(request, timeout=8) as response:
+            status = response.status
+            content_type = response.headers.get('Content-Type', '').split(';', 1)[0][:50]
+            body = response.read(65536)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        content_type = exc.headers.get('Content-Type', '').split(';', 1)[0][:50] if exc.headers else ''
+        body = exc.read(65536)
+        exc.close()
+    except (OSError, urllib.error.URLError):
+        return {'section': section, 'host': urlparse(origin).hostname,
+                'status': 'none', 'content_type': 'none', 'bytes': 0, 'result': 'NETWORK_ERROR'}
+
+    lower = body.lower()
+    challenges = (b'cf-chl', b'challenge-platform', b'captcha', b'just a moment',
+                  b'checking your browser', b'ddos-guard', b'attention required')
+    if any(marker in lower for marker in challenges):
+        result = 'CHALLENGE_SUSPECTED'
+    elif status in (403, 429):
+        result = 'HTTP_RESTRICTED'
+    elif status is not None and 300 <= status <= 399:
+        result = 'REDIRECT'
+    elif status != 200:
+        result = 'HTTP_OTHER'
+    elif b'b-content__inline_item' in lower:
+        result = 'CATALOG_MARKUP_FOUND'
+    elif b'<html' in lower:
+        result = 'HTML_WITHOUT_CATALOG_MARKUP'
+    else:
+        result = 'UNEXPECTED_CONTENT'
+    return {'section': section, 'host': urlparse(origin).hostname, 'status': status,
+            'content_type': content_type, 'bytes': len(body), 'result': result}
+
+
+def maybe_probe_source(section: str) -> None:
+    """Rate limit diagnostics so repeated user reloads do not flood the site."""
+    global _last_probe
+    with _probe_lock:
+        now = time.monotonic()
+        if now - _last_probe < PROBE_INTERVAL:
+            return
+        _last_probe = now
+    try:
+        result = probe_source(section)
+        print('Catalog source probe: ' + ' '.join(f'{k}={v}' for k, v in result.items()), flush=True)
+    except (ValueError, OSError) as exc:
+        print('Catalog source probe: result=CONFIG_OR_NETWORK_ERROR type=' + type(exc).__name__, flush=True)
+
 
 
 def classify_upstream_error(exc):
@@ -38,6 +119,9 @@ def classify_upstream_error(exc):
         cursor = getattr(cursor, '__cause__', None)
 
     name = type(exc).__name__
+    if name == 'EmptyPage':
+        return 'EMPTY_CATALOG', ('Библиотека не нашла карточки на странице источника. '
+                                 'Возможны страница проверки, другое зеркало или изменение разметки.'), status
     # Exception messages can contain signed URLs or cookies. Match safe markers
     # only; never print the message or the full request path (query has URL).
     message = str(exc).lower()
@@ -66,7 +150,7 @@ def classify_upstream_error(exc):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'PS4Catalog/0.3.1'
+    server_version = 'PS4Catalog/0.3.2'
 
     def log_request(self, code='-', size='-'):
         # Request URLs for /api/stream contain signed source URLs; never log them.
@@ -79,6 +163,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         q = parse_qs(path.query, keep_blank_values=False)
         get = lambda n, default='': q.get(n, [default])[0]
+        section = 'n/a'
         try:
             page = int(get('page', '1'))
             if not 1 <= page <= 100:
@@ -86,12 +171,16 @@ class Handler(BaseHTTPRequestHandler):
             if path.path in ('/', '/health'):
                 return self.respond(200, {'ok': True, 'service': 'PS4 catalog', 'version': '0.3'})
             if path.path == '/api/home':
+                section = 'films'
                 films = catalog.navigation('films', 1)['items']
+                section = 'series'
                 serials = catalog.navigation('series', 1)['items']
                 return self.respond(200, {'new': (films[:12] + serials[:8]), 'films': films[:18], 'series': serials[:18]})
             if path.path == '/api/catalog':
-                return self.respond(200, catalog.navigation(get('category', 'films'), page))
+                section = get('category', 'films')
+                return self.respond(200, catalog.navigation(section, page))
             if path.path == '/api/search':
+                section = 'search'
                 return self.respond(200, catalog.search(get('q', '')[:MAX_QUERY], page))
             if path.path == '/api/detail':
                 return self.respond(200, catalog.details(get('url')))
@@ -109,8 +198,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             # Do not leak source URLs, signed tokens, cookies or exception details.
             category, hint, status = classify_upstream_error(exc)
-            print(f'Catalog source diagnostic: route={path.path} category={category} '
+            print(f'Catalog source diagnostic: route={path.path} section={section} category={category} '
                   f'exception={type(exc).__name__} upstream_http={status or "unknown"}', flush=True)
+            if category == 'EMPTY_CATALOG':
+                maybe_probe_source(section)
             return self.respond(502, {'error': hint, 'diagnostic': category})
 
     def do_POST(self):
