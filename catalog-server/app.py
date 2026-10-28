@@ -15,8 +15,63 @@ except ImportError:
 MAX_QUERY = 1024
 
 
+def classify_upstream_error(exc):
+    """Return a safe, non-sensitive hint; never include upstream exception text in JSON.
+
+    This distinguishes common HTTP blocks from library/parser failures but does
+    NOT claim to detect a real CAPTCHA with certainty.
+    """
+    status = None
+    cursor = exc
+    for _ in range(4):
+        if cursor is None:
+            break
+        candidate = getattr(cursor, 'status_code', None)
+        if candidate is None:
+            candidate = getattr(cursor, 'code', None)
+        if candidate is None:
+            response = getattr(cursor, 'response', None)
+            candidate = getattr(response, 'status_code', None)
+        if isinstance(candidate, int) and 100 <= candidate <= 599:
+            status = candidate
+            break
+        cursor = getattr(cursor, '__cause__', None)
+
+    name = type(exc).__name__
+    # Exception messages can contain signed URLs or cookies. Match safe markers
+    # only; never print the message or the full request path (query has URL).
+    message = str(exc).lower()
+    if status == 403 or '403 forbidden' in message or 'http 403' in message:
+        return 'BLOCKED_403', ('HDrezka отклонила запрос сервера (HTTP 403). '
+                               'Возможна проверка Cloudflare/капча или блокировка IP Render.'), status
+    if status == 429 or 'http 429' in message:
+        return 'RATE_LIMIT_429', ('Источник ограничил частоту запросов (HTTP 429). '
+                                  'Попробуй позже; не выполняй частые повторы.'), status
+    if any(marker in message for marker in ('captcha', 'cloudflare', 'just a moment', 'checking your browser', 'challenge-platform')):
+        return 'CHALLENGE_SUSPECTED', ('Библиотека обнаружила признаки проверочной страницы. '
+                                       'Возможна капча/Cloudflare.'), status
+    if status in (404, 410):
+        return 'UPSTREAM_NOT_FOUND', ('HDrezka вернула HTTP ' + str(status) +
+                                       '. Возможно, устарел адрес или зеркало.'), status
+    if status is not None:
+        return 'UPSTREAM_HTTP', ('HDrezka вернула HTTP ' + str(status) +
+                                 '. Проверь доступность сайта для Render.'), status
+    if isinstance(exc, (TimeoutError, ConnectionError)) or 'timeout' in name.lower() or 'connection' in name.lower():
+        return 'NETWORK_ERROR', 'Не удалось установить соединение с источником или ожидание истекло.', None
+    if isinstance(exc, (AttributeError, IndexError, KeyError, TypeError)):
+        return 'PARSER_ERROR', ('Python-библиотека не смогла разобрать ответ сайта. '
+                                'Возможны изменение разметки или проверочная страница.'), None
+    return 'UNKNOWN_UPSTREAM', ('Ошибка обращения к источнику. Открой Logs сервиса каталога '
+                                'в Render и проверь код диагностики.'), None
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'PS4Catalog/0.3'
+    server_version = 'PS4Catalog/0.3.1'
+
+    def log_request(self, code='-', size='-'):
+        # Request URLs for /api/stream contain signed source URLs; never log them.
+        safe_path = urlsplit(self.path).path
+        self.log_message('%s %s HTTP %s', self.command, safe_path, code)
 
     def do_GET(self):
         if len(self.path) > 2500:
@@ -52,9 +107,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self.respond(400, {'error': str(exc)})
         except Exception as exc:
-            # Upstream errors do not leak source URLs, internal HTTP responses or tracebacks.
-            print(f'Catalog upstream failed: {type(exc).__name__}', flush=True)
-            return self.respond(502, {'error': 'Источник временно недоступен. Проверь зеркало/сеть или попробуй позже.'})
+            # Do not leak source URLs, signed tokens, cookies or exception details.
+            category, hint, status = classify_upstream_error(exc)
+            print(f'Catalog source diagnostic: route={path.path} category={category} '
+                  f'exception={type(exc).__name__} upstream_http={status or "unknown"}', flush=True)
+            return self.respond(502, {'error': hint, 'diagnostic': category})
 
     def do_POST(self):
         self.respond(405, {'error': 'Only GET is available'})
