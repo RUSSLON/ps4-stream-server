@@ -1,0 +1,2 @@
+# Third-party website client: not an official HDrezka API.
+git+https://github.com/kristal374/hdrezka-api.git
